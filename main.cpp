@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <sstream>
 #include <cstring>
+#include <cstdint>
 
 class FileStorage {
 private:
