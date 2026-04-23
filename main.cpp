@@ -3,290 +3,222 @@
 #include <vector>
 #include <algorithm>
 #include <string>
-#include <unordered_map>
 #include <sstream>
-#include <cstring>
-#include <cstdint>
+#include <functional>
 
 class FileStorage {
 private:
-    static constexpr const char* DATA_FILE = "storage/data.db";
-    static constexpr const char* INDEX_FILE = "storage/index.db";
-    static constexpr int BUFFER_SIZE = 4096;
+    static constexpr int NUM_BUCKETS = 100;  // Fixed number of files
+    static constexpr const char* BASE_DIR = "storage";
 
-    // Structure to store index information
-    struct IndexInfo {
-        uint32_t offset;  // Offset in data file
-        uint32_t count;   // Number of values
-    };
+    int getBucket(const std::string& index) {
+        std::hash<std::string> hasher;
+        return hasher(index) % NUM_BUCKETS;
+    }
 
-    std::unordered_map<std::string, IndexInfo> index_cache;
-    bool cache_dirty;
+    std::string getBucketFilename(int bucket) {
+        return std::string(BASE_DIR) + "/bucket_" + std::to_string(bucket) + ".dat";
+    }
 
     void ensureDirectoryExists() {
-        std::ifstream dir_check("storage");
+        std::ifstream dir_check(BASE_DIR);
         if (!dir_check.good()) {
             system("mkdir -p storage");
         }
         dir_check.close();
     }
 
-    void loadIndex() {
-        std::ifstream idx_file(INDEX_FILE, std::ios::binary);
-        if (!idx_file.is_open()) return;
-
-        uint32_t index_count;
-        idx_file.read(reinterpret_cast<char*>(&index_count), sizeof(index_count));
-
-        for (uint32_t i = 0; i < index_count; i++) {
-            uint32_t key_len;
-            idx_file.read(reinterpret_cast<char*>(&key_len), sizeof(key_len));
-
-            std::string key(key_len, '\0');
-            idx_file.read(&key[0], key_len);
-
-            IndexInfo info;
-            idx_file.read(reinterpret_cast<char*>(&info.offset), sizeof(info.offset));
-            idx_file.read(reinterpret_cast<char*>(&info.count), sizeof(info.count));
-
-            index_cache[key] = info;
-        }
-        idx_file.close();
-        cache_dirty = false;
-    }
-
-    void saveIndex() {
-        if (!cache_dirty) return;
-
-        std::ofstream idx_file(INDEX_FILE, std::ios::binary);
-        if (!idx_file.is_open()) return;
-
-        uint32_t index_count = index_cache.size();
-        idx_file.write(reinterpret_cast<const char*>(&index_count), sizeof(index_count));
-
-        for (const auto& [key, info] : index_cache) {
-            uint32_t key_len = key.length();
-            idx_file.write(reinterpret_cast<const char*>(&key_len), sizeof(key_len));
-            idx_file.write(key.c_str(), key_len);
-            idx_file.write(reinterpret_cast<const char*>(&info.offset), sizeof(info.offset));
-            idx_file.write(reinterpret_cast<const char*>(&info.count), sizeof(info.count));
-        }
-        idx_file.close();
-        cache_dirty = false;
-    }
-
 public:
-    FileStorage() : cache_dirty(false) {
+    FileStorage() {
         ensureDirectoryExists();
-        loadIndex();
-    }
-
-    ~FileStorage() {
-        saveIndex();
     }
 
     void insert(const std::string& index, int value) {
-        // Load existing values
-        std::vector<int> values;
-        if (index_cache.find(index) != index_cache.end()) {
-            const IndexInfo& info = index_cache[index];
-            std::ifstream data_file(DATA_FILE, std::ios::binary);
-            if (data_file.is_open()) {
-                data_file.seekg(info.offset);
-                for (uint32_t i = 0; i < info.count; i++) {
+        int bucket = getBucket(index);
+        std::string filename = getBucketFilename(bucket);
+
+        // Read all data from the bucket
+        std::vector<std::pair<std::string, std::vector<int>>> bucket_data;
+
+        std::ifstream infile(filename, std::ios::binary);
+        if (infile.is_open()) {
+            while (!infile.eof()) {
+                // Read index length
+                size_t index_len;
+                infile.read(reinterpret_cast<char*>(&index_len), sizeof(index_len));
+                if (infile.eof()) break;
+
+                // Read index
+                std::string idx(index_len, '\0');
+                infile.read(&idx[0], index_len);
+
+                // Read value count
+                size_t value_count;
+                infile.read(reinterpret_cast<char*>(&value_count), sizeof(value_count));
+
+                // Read values
+                std::vector<int> values;
+                for (size_t i = 0; i < value_count; i++) {
                     int val;
-                    data_file.read(reinterpret_cast<char*>(&val), sizeof(int));
+                    infile.read(reinterpret_cast<char*>(&val), sizeof(int));
                     values.push_back(val);
                 }
-                data_file.close();
+
+                bucket_data.push_back({idx, values});
+            }
+            infile.close();
+        }
+
+        // Find and update the index
+        bool found = false;
+        for (auto& [idx, values] : bucket_data) {
+            if (idx == index) {
+                // Check if value already exists
+                auto it = std::lower_bound(values.begin(), values.end(), value);
+                if (it != values.end() && *it == value) {
+                    return; // Value already exists
+                }
+                values.insert(it, value);
+                found = true;
+                break;
             }
         }
 
-        // Check for duplicate
-        if (std::binary_search(values.begin(), values.end(), value)) {
-            return;
+        // If not found, add new entry
+        if (!found) {
+            bucket_data.push_back({index, {value}});
         }
-
-        // Insert and sort
-        values.push_back(value);
-        std::sort(values.begin(), values.end());
 
         // Write back to file
-        std::fstream data_file(DATA_FILE, std::ios::in | std::ios::out | std::ios::binary);
-        if (!data_file.is_open()) {
-            data_file.clear();
-            data_file.open(DATA_FILE, std::ios::out | std::ios::binary);
-            data_file.close();
-            data_file.open(DATA_FILE, std::ios::in | std::ios::out | std::ios::binary);
-        }
+        std::ofstream outfile(filename, std::ios::binary | std::ios::trunc);
+        if (outfile.is_open()) {
+            for (const auto& [idx, values] : bucket_data) {
+                // Write index length
+                size_t index_len = idx.length();
+                outfile.write(reinterpret_cast<const char*>(&index_len), sizeof(index_len));
 
-        // Find position to write
-        uint32_t new_offset = 0;
-        if (!index_cache.empty()) {
-            // Find the last index and calculate new offset
-            auto it = index_cache.begin();
-            uint32_t max_offset = 0;
-            uint32_t max_count = 0;
+                // Write index
+                outfile.write(idx.c_str(), index_len);
 
-            for (const auto& [key, info] : index_cache) {
-                if (info.offset + info.count * sizeof(int) > max_offset) {
-                    max_offset = info.offset + info.count * sizeof(int);
+                // Write value count
+                size_t value_count = values.size();
+                outfile.write(reinterpret_cast<const char*>(&value_count), sizeof(value_count));
+
+                // Write values
+                for (int val : values) {
+                    outfile.write(reinterpret_cast<const char*>(&val), sizeof(int));
                 }
             }
-            new_offset = max_offset;
+            outfile.close();
         }
-
-        // If index already exists, we need to reorganize
-        if (index_cache.find(index) != index_cache.end()) {
-            // For simplicity, append at the end (could be optimized)
-            IndexInfo old_info = index_cache[index];
-
-            // Read all data after this index
-            std::vector<std::pair<std::string, std::vector<int>>> all_data;
-
-            // First, collect all data including the modified one
-            for (const auto& [key, info] : index_cache) {
-                if (key != index) {
-                    std::vector<int> vals;
-                    data_file.seekg(info.offset);
-                    for (uint32_t i = 0; i < info.count; i++) {
-                        int val;
-                        data_file.read(reinterpret_cast<char*>(&val), sizeof(int));
-                        vals.push_back(val);
-                    }
-                    all_data.push_back({key, vals});
-                } else {
-                    all_data.push_back({index, values});
-                }
-            }
-
-            // Clear the file and rewrite everything
-            data_file.close();
-            data_file.open(DATA_FILE, std::ios::out | std::ios::trunc | std::ios::binary);
-
-            uint32_t offset = 0;
-            for (auto& [key, vals] : all_data) {
-                index_cache[key].offset = offset;
-                index_cache[key].count = vals.size();
-
-                for (int val : vals) {
-                    data_file.write(reinterpret_cast<const char*>(&val), sizeof(int));
-                }
-                offset += vals.size() * sizeof(int);
-            }
-            cache_dirty = true;
-        } else {
-            // New index, append at the end
-            data_file.seekp(new_offset);
-            for (int val : values) {
-                data_file.write(reinterpret_cast<const char*>(&val), sizeof(int));
-            }
-
-            index_cache[index].offset = new_offset;
-            index_cache[index].count = values.size();
-            cache_dirty = true;
-        }
-
-        data_file.close();
     }
 
     void remove(const std::string& index, int value) {
-        if (index_cache.find(index) == index_cache.end()) {
-            return;
-        }
+        int bucket = getBucket(index);
+        std::string filename = getBucketFilename(bucket);
 
-        const IndexInfo& info = index_cache[index];
-        std::vector<int> values;
+        // Read all data from the bucket
+        std::vector<std::pair<std::string, std::vector<int>>> bucket_data;
 
-        // Read existing values
-        std::ifstream data_file(DATA_FILE, std::ios::binary);
-        if (data_file.is_open()) {
-            data_file.seekg(info.offset);
-            for (uint32_t i = 0; i < info.count; i++) {
-                int val;
-                data_file.read(reinterpret_cast<char*>(&val), sizeof(int));
-                if (val != value) {
-                    values.push_back(val);
-                }
-            }
-            data_file.close();
-        }
+        std::ifstream infile(filename, std::ios::binary);
+        if (infile.is_open()) {
+            while (!infile.eof()) {
+                // Read index length
+                size_t index_len;
+                infile.read(reinterpret_cast<char*>(&index_len), sizeof(index_len));
+                if (infile.eof()) break;
 
-        if (values.empty()) {
-            // Remove the index entirely
-            index_cache.erase(index);
-            cache_dirty = true;
+                // Read index
+                std::string idx(index_len, '\0');
+                infile.read(&idx[0], index_len);
 
-            // Reorganize file (simplified approach)
-            reorganizeFile();
-        } else {
-            // Update with remaining values
-            std::fstream data_file(DATA_FILE, std::ios::in | std::ios::out | std::ios::binary);
-            if (data_file.is_open()) {
-                data_file.seekp(info.offset);
-                for (int val : values) {
-                    data_file.write(reinterpret_cast<const char*>(&val), sizeof(int));
-                }
-                index_cache[index].count = values.size();
-                cache_dirty = true;
-                data_file.close();
-            }
-        }
-    }
+                // Read value count
+                size_t value_count;
+                infile.read(reinterpret_cast<char*>(&value_count), sizeof(value_count));
 
-    void reorganizeFile() {
-        // Collect all data
-        std::vector<std::pair<std::string, std::vector<int>>> all_data;
-
-        std::ifstream in_file(DATA_FILE, std::ios::binary);
-        if (in_file.is_open()) {
-            for (const auto& [key, info] : index_cache) {
-                std::vector<int> vals;
-                in_file.seekg(info.offset);
-                for (uint32_t i = 0; i < info.count; i++) {
+                // Read values
+                std::vector<int> values;
+                for (size_t i = 0; i < value_count; i++) {
                     int val;
-                    in_file.read(reinterpret_cast<char*>(&val), sizeof(int));
-                    vals.push_back(val);
+                    infile.read(reinterpret_cast<char*>(&val), sizeof(int));
+                    if (val != value || idx != index) {
+                        values.push_back(val);
+                    }
                 }
-                all_data.push_back({key, vals});
+
+                // Only keep non-empty indices
+                if (!values.empty() || idx != index) {
+                    if (idx == index && !values.empty()) {
+                        bucket_data.push_back({idx, values});
+                    } else if (idx != index) {
+                        bucket_data.push_back({idx, values});
+                    }
+                }
             }
-            in_file.close();
+            infile.close();
         }
 
-        // Rewrite file
-        std::ofstream out_file(DATA_FILE, std::ios::binary | std::ios::trunc);
-        if (out_file.is_open()) {
-            uint32_t offset = 0;
-            for (auto& [key, vals] : all_data) {
-                index_cache[key].offset = offset;
-                index_cache[key].count = vals.size();
+        // Write back to file
+        std::ofstream outfile(filename, std::ios::binary | std::ios::trunc);
+        if (outfile.is_open()) {
+            for (const auto& [idx, values] : bucket_data) {
+                // Write index length
+                size_t index_len = idx.length();
+                outfile.write(reinterpret_cast<const char*>(&index_len), sizeof(index_len));
 
-                for (int val : vals) {
-                    out_file.write(reinterpret_cast<const char*>(&val), sizeof(int));
+                // Write index
+                outfile.write(idx.c_str(), index_len);
+
+                // Write value count
+                size_t value_count = values.size();
+                outfile.write(reinterpret_cast<const char*>(&value_count), sizeof(value_count));
+
+                // Write values
+                for (int val : values) {
+                    outfile.write(reinterpret_cast<const char*>(&val), sizeof(int));
                 }
-                offset += vals.size() * sizeof(int);
             }
-            out_file.close();
+            outfile.close();
         }
     }
 
     std::vector<int> find(const std::string& index) {
+        int bucket = getBucket(index);
+        std::string filename = getBucketFilename(bucket);
+
         std::vector<int> result;
 
-        if (index_cache.find(index) == index_cache.end()) {
-            return result;
-        }
+        std::ifstream infile(filename, std::ios::binary);
+        if (infile.is_open()) {
+            while (!infile.eof()) {
+                // Read index length
+                size_t index_len;
+                infile.read(reinterpret_cast<char*>(&index_len), sizeof(index_len));
+                if (infile.eof()) break;
 
-        const IndexInfo& info = index_cache[index];
-        std::ifstream data_file(DATA_FILE, std::ios::binary);
-        if (data_file.is_open()) {
-            data_file.seekg(info.offset);
-            for (uint32_t i = 0; i < info.count; i++) {
-                int val;
-                data_file.read(reinterpret_cast<char*>(&val), sizeof(int));
-                result.push_back(val);
+                // Read index
+                std::string idx(index_len, '\0');
+                infile.read(&idx[0], index_len);
+
+                // Read value count
+                size_t value_count;
+                infile.read(reinterpret_cast<char*>(&value_count), sizeof(value_count));
+
+                // Read values
+                std::vector<int> values;
+                for (size_t i = 0; i < value_count; i++) {
+                    int val;
+                    infile.read(reinterpret_cast<char*>(&val), sizeof(int));
+                    if (idx == index) {
+                        result.push_back(val);
+                    }
+                }
+
+                if (idx == index) {
+                    break;
+                }
             }
-            data_file.close();
+            infile.close();
         }
 
         return result;
